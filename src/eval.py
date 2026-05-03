@@ -35,6 +35,10 @@ If U_seq.npy or W_gt files are missing, evaluation still runs and saves predicti
 but skips GT metrics.
 """
 
+from models.joint_uw_model import JointUWProbabilisticMLP
+from geometry.observation import observation_operator_softW
+
+
 import os
 import csv
 import glob
@@ -154,152 +158,6 @@ def confidence_filtering_metrics(vertex_error, vertex_std, keep_rates):
 # ============================================================
 # Model definition: must match train.py
 # ============================================================
-
-class JointUWProbabilisticMLP(nn.Module):
-    def __init__(
-        self,
-        y_dim: int,
-        U_dim: int,
-        K_obs: int,
-        N_vertices: int,
-        z_dim: int = 32,
-        hidden_dim: int = 256,
-        logvar_min: float = -8.0,
-        logvar_max: float = 2.0,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-
-        self.y_dim = y_dim
-        self.U_dim = U_dim
-        self.K_obs = K_obs
-        self.N_vertices = N_vertices
-        self.z_dim = z_dim
-        self.hidden_dim = hidden_dim
-        self.logvar_min = logvar_min
-        self.logvar_max = logvar_max
-
-        self.encoder = nn.Sequential(
-            nn.Linear(y_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-        )
-
-        self.z_mu_head = nn.Linear(hidden_dim, z_dim)
-        self.z_logvar_head = nn.Linear(hidden_dim, z_dim)
-
-        decoder_in = y_dim + z_dim
-
-        self.decoder_backbone = nn.Sequential(
-            nn.Linear(decoder_in, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-        )
-
-        self.U_mu_head = nn.Linear(hidden_dim, U_dim)
-        self.U_logvar_head = nn.Linear(hidden_dim, U_dim)
-        self.W_head = nn.Linear(hidden_dim, K_obs * N_vertices)
-
-    def reparameterize(self, mu, logvar, sample_z=True):
-        if not sample_z:
-            return mu
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, y_norm, sample_z=True):
-        h = self.encoder(y_norm)
-
-        z_mu = self.z_mu_head(h)
-        z_logvar = self.z_logvar_head(h).clamp(min=-12.0, max=8.0)
-
-        z = self.reparameterize(z_mu, z_logvar, sample_z=sample_z)
-
-        dec_in = torch.cat([y_norm, z], dim=-1)
-        hd = self.decoder_backbone(dec_in)
-
-        U_mu = self.U_mu_head(hd)
-        raw_logvar = self.U_logvar_head(hd)
-        U_logvar = torch.clamp(raw_logvar, min=self.logvar_min, max=self.logvar_max)
-
-        W_logits = self.W_head(hd).view(-1, self.K_obs, self.N_vertices)
-
-        return U_mu, U_logvar, W_logits, z_mu, z_logvar
-
-
-# ============================================================
-# Observation operator
-# ============================================================
-
-def torch_perspective_project(X_world, Kmat, R, t):
-    """
-    X_world: [B,K,3]
-    Kmat:    [B,3,3]
-    R:       [B,3,3]
-    t:       [B,3]
-    """
-    X_cam = torch.einsum("bij,bkj->bki", R, X_world) + t[:, None, :]
-
-    z = X_cam[..., 2:3].clamp_min(1e-6)
-    x_norm = X_cam[..., 0:1] / z
-    y_norm = X_cam[..., 1:2] / z
-
-    fx = Kmat[:, 0, 0].view(-1, 1, 1)
-    fy = Kmat[:, 1, 1].view(-1, 1, 1)
-    cx = Kmat[:, 0, 2].view(-1, 1, 1)
-    cy = Kmat[:, 1, 2].view(-1, 1, 1)
-
-    u = fx * x_norm + cx
-    v = fy * y_norm + cy
-
-    uv = torch.cat([u, v], dim=-1)
-    return uv, X_cam
-
-
-def observation_operator_softW(U_phys, W_logits, X0, Kmat, R, t, normalize_y=True):
-    """
-    U_phys:   [B,N,3]
-    W_logits: [B,K,N]
-    X0:       [B,N,3]
-
-    Returns:
-        y_hat: [B,K,2]
-        W:     [B,K,N]
-    """
-    W = F.softmax(W_logits, dim=-1)
-
-    X_surface = torch.einsum("bkn,bnd->bkd", W, X0)
-    U_surface = torch.einsum("bkn,bnd->bkd", W, U_phys)
-
-    uv0, _ = torch_perspective_project(X_surface, Kmat, R, t)
-    uvt, _ = torch_perspective_project(X_surface + U_surface, Kmat, R, t)
-
-    y_pixel_hat = uvt - uv0
-
-    if normalize_y:
-        fx = Kmat[:, 0, 0].view(-1, 1, 1)
-        y_hat = y_pixel_hat / fx
-    else:
-        y_hat = y_pixel_hat
-
-    return y_hat, W
-
 
 def sparse_W_metrics(W_logits_np, W_idx, W_val):
     """
