@@ -121,6 +121,17 @@ def gaussian_nll_numpy(target, mu, std, eps=1e-8):
     return float(np.mean(0.5 * (np.log(var) + (target - mu) ** 2 / var)))
 
 
+def rms_calibration_scale(abs_error, std, eps=1e-12):
+    """
+    Post-hoc one-number uncertainty calibration.
+    alpha > 1 means the predicted uncertainty is under-estimated.
+    alpha < 1 means the predicted uncertainty is over-estimated.
+    """
+    err2 = np.mean(np.asarray(abs_error, dtype=np.float64) ** 2)
+    std2 = np.mean(np.asarray(std, dtype=np.float64) ** 2) + eps
+    return float(np.sqrt(err2 / std2))
+
+
 def confidence_filtering_metrics(vertex_error, vertex_std, keep_rates):
     e = vertex_error.reshape(-1)
     s = vertex_std.reshape(-1)
@@ -377,6 +388,7 @@ def predict_sequence_real_like(
     mc_samples=8,
     normalize_y_for_projection=True,
     save_W=True,
+    return_samples=False,
 ):
     """
     Real-like inference:
@@ -496,7 +508,19 @@ def predict_sequence_real_like(
     else:
         W_seq = None
 
-    return U_pred_seq, U_std_seq, y_hat_seq, W_seq, W_entropy_seq
+    # Posterior variance decomposition:
+    # total variance = E_z[var(U|y,z)] + var_z(E[U|y,z])
+    posterior_extra = None
+    if return_samples:
+        aleatoric_var_flat = np.mean(var_samples, axis=0)
+        epistemic_var_flat = np.var(mu_samples, axis=0)
+        posterior_extra = {
+            "U_mu_samples": mu_samples.reshape(mc_samples, T, N, 3).astype(np.float32),
+            "U_aleatoric_std_seq": np.sqrt(np.maximum(aleatoric_var_flat, 1e-12)).reshape(T, N, 3).astype(np.float32),
+            "U_epistemic_std_seq": np.sqrt(np.maximum(epistemic_var_flat, 1e-12)).reshape(T, N, 3).astype(np.float32),
+        }
+
+    return U_pred_seq, U_std_seq, y_hat_seq, W_seq, W_entropy_seq, posterior_extra
 
 
 # ============================================================
@@ -518,7 +542,7 @@ def evaluate_one_sample(sample_dir, model, norm, device, args):
     T, K_obs, _ = y.shape
     N = X0.shape[0]
 
-    U_pred_seq, U_std_seq, y_hat_seq, W_seq, W_entropy_seq = predict_sequence_real_like(
+    U_pred_seq, U_std_seq, y_hat_seq, W_seq, W_entropy_seq, posterior_extra = predict_sequence_real_like(
         model=model,
         y=y,
         X0=X0,
@@ -531,6 +555,7 @@ def evaluate_one_sample(sample_dir, model, norm, device, args):
         mc_samples=args.mc_samples,
         normalize_y_for_projection=not args.no_normalize_y_for_projection,
         save_W=args.save_W,
+        return_samples=args.save_samples,
     )
 
     metrics = {
@@ -604,6 +629,8 @@ def evaluate_one_sample(sample_dir, model, norm, device, args):
             "coverage_1std_vertex": coverage_rate(vertex_error, vertex_std, 1.0),
             "coverage_2std_vertex": coverage_rate(vertex_error, vertex_std, 2.0),
             "coverage_3std_vertex": coverage_rate(vertex_error, vertex_std, 3.0),
+            "calibration_scale_component": rms_calibration_scale(abs_error_seq, U_std_seq),
+            "calibration_scale_vertex": rms_calibration_scale(vertex_error, vertex_std),
             "error_std_corr_vertex": safe_corr(vertex_error, vertex_std),
             "error_std_corr_component": safe_corr(abs_error_seq, U_std_seq),
             "nll_physical": gaussian_nll_numpy(U_seq, U_pred_seq, U_std_seq),
@@ -614,6 +641,24 @@ def evaluate_one_sample(sample_dir, model, norm, device, args):
             "curve_pred_max_abs": float(np.max(np.abs(pred_curve))),
             "curve_mean_std": float(np.mean(np.abs(std_curve))),
         })
+
+        # Calibrated coverage. This only reports calibration quality; it does not change prediction.
+        alpha_c = metrics["calibration_scale_component"]
+        alpha_v = metrics["calibration_scale_vertex"]
+        metrics["coverage_1std_component_cal"] = coverage_rate(abs_error_seq, alpha_c * U_std_seq, 1.0)
+        metrics["coverage_2std_component_cal"] = coverage_rate(abs_error_seq, alpha_c * U_std_seq, 2.0)
+        metrics["coverage_3std_component_cal"] = coverage_rate(abs_error_seq, alpha_c * U_std_seq, 3.0)
+        metrics["coverage_1std_vertex_cal"] = coverage_rate(vertex_error, alpha_v * vertex_std, 1.0)
+        metrics["coverage_2std_vertex_cal"] = coverage_rate(vertex_error, alpha_v * vertex_std, 2.0)
+        metrics["coverage_3std_vertex_cal"] = coverage_rate(vertex_error, alpha_v * vertex_std, 3.0)
+
+        if posterior_extra is not None:
+            epi = np.linalg.norm(posterior_extra["U_epistemic_std_seq"], axis=2)
+            ale = np.linalg.norm(posterior_extra["U_aleatoric_std_seq"], axis=2)
+            metrics["mean_epistemic_std"] = float(np.mean(epi))
+            metrics["mean_aleatoric_std"] = float(np.mean(ale))
+            metrics["error_epistemic_corr_vertex"] = safe_corr(vertex_error, epi)
+            metrics["error_aleatoric_corr_vertex"] = safe_corr(vertex_error, ale)
 
         metrics.update(confidence_filtering_metrics(vertex_error, vertex_std, args.keep_rates))
     else:
@@ -648,6 +693,11 @@ def evaluate_one_sample(sample_dir, model, norm, device, args):
         np.save(os.path.join(out_dir, "y_hat_seq.npy"), y_hat_seq.astype(np.float32))
         np.save(os.path.join(out_dir, "y_input.npy"), y.astype(np.float32))
         np.save(os.path.join(out_dir, "W_entropy_seq.npy"), W_entropy_seq.astype(np.float32))
+
+        if posterior_extra is not None:
+            np.save(os.path.join(out_dir, "U_mu_samples.npy"), posterior_extra["U_mu_samples"].astype(np.float32))
+            np.save(os.path.join(out_dir, "U_epistemic_std_seq.npy"), posterior_extra["U_epistemic_std_seq"].astype(np.float32))
+            np.save(os.path.join(out_dir, "U_aleatoric_std_seq.npy"), posterior_extra["U_aleatoric_std_seq"].astype(np.float32))
 
         if W_seq is not None:
             np.save(os.path.join(out_dir, "W_pred_seq.npy"), W_seq.astype(np.float32))
@@ -775,6 +825,7 @@ def evaluate(args):
     print("real-like input: y only")
     print("save_predictions:", args.save_predictions)
     print("save_W:", args.save_W)
+    print("save_samples:", args.save_samples)
 
     rows = []
     for i, sample_dir in enumerate(sample_dirs):
@@ -821,7 +872,12 @@ def evaluate(args):
         "error_std_corr_vertex",
         "coverage_1std_component",
         "coverage_2std_component",
+        "coverage_2std_component_cal",
+        "calibration_scale_component",
+        "calibration_scale_vertex",
         "mean_vertex_std",
+        "mean_epistemic_std",
+        "mean_aleatoric_std",
         "W_ce",
         "W_top1_acc",
         "W_entropy_mean",
@@ -858,6 +914,7 @@ def parse_args():
     parser.add_argument("--keep_rates", type=float, nargs="+", default=[0.05, 0.1, 0.2, 0.5, 1.0])
 
     parser.add_argument("--save_W", action="store_true", help="Save W_pred_seq.npy. Can be large but ok for this dataset.")
+    parser.add_argument("--save_samples", action="store_true", help="Save posterior U samples and epistemic/aleatoric std maps.")
     parser.add_argument("--no_normalize_y_for_projection", action="store_true")
     parser.add_argument("--cpu", action="store_true")
 

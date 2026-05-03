@@ -1,0 +1,37 @@
+# data and outputs
+data/
+outputs/
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.obj
+*.ply
+*.mp4
+*.avi
+*.mov
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# system
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+
+# backup
+*.bak
